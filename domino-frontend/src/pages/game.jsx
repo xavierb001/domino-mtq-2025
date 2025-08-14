@@ -11,10 +11,21 @@ import "../styles/game.css";
 import ResultPopup from '../components/ResultPopup';
 import '../styles/popup.css';
 
-
 import shareIcon from '../assets/images/share_icon.png'; // Assure-toi d'avoir une icône de partage
 const imageFondJeuUrl = "https://res.cloudinary.com/dwvfz8o89/image/upload/f_auto,q_auto/v1/domino/n39kvljl1qutdoorce3z";
 const dominoBack = "https://res.cloudinary.com/dwvfz8o89/image/upload/f_auto,q_auto/v1/domino/dominos/zclnlh38fxlo8ektqzww";
+
+// --- util: userId persistant pour reconnexion même siège ---
+function getOrCreateUserId() {
+  const key = 'domino_user_id';
+  let id = localStorage.getItem(key);
+  if (!id) {
+    id = (crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2) + Date.now().toString(36));
+    localStorage.setItem(key, id);
+  }
+  return id;
+}
+
 function Game() {
   const { id: gameId } = useParams();
   const navigate = useNavigate();
@@ -36,6 +47,12 @@ function Game() {
   const [consecutivePasses, setConsecutivePasses] = useState(0); // Nombre de passes consécutives
   const [newMessageReceived, setNewMessageReceived] = useState(false); // ✅ État pour indiquer un nouveau message
 
+  // Overlay pause/attente + nombre de joueurs manquants
+  const [overlay, setOverlay] = useState({ visible: false, reason: '' });
+  const [waitingNeeded, setWaitingNeeded] = useState(null);
+
+  // userId persistant
+  const userId = getOrCreateUserId();
 
   const copyGameLink = () => {
     const gameLink = window.location.href; // URL actuelle de la partie
@@ -48,14 +65,15 @@ function Game() {
       });
   };
 
-// Fonction pour gérer le clic sur l'icône
+  // Fonction pour gérer le clic sur l'icône
   const toggleChatbox = () => {
-  setIsChatboxVisible((prev) => !prev);
-  setNewMessageReceived(false); // ✅ Réinitialiser l'alerte
+    setIsChatboxVisible((prev) => !prev);
+    setNewMessageReceived(false); // ✅ Réinitialiser l'alerte
   };
+
   const joinGame = () => {
     if (username.trim()) {
-      socket.emit('joinGame', { gameId, username });
+      socket.emit('joinGame', { gameId, username, userId }); // <= envoie userId
       setJoined(true);
     } else {
       alert('Veuillez entrer un pseudo avant de rejoindre.');
@@ -73,12 +91,10 @@ function Game() {
     
     setConsecutivePasses((prevPasses) => {
       const newPasses = prevPasses + 1;
-  
       if (newPasses >= players.length) {
         socket.emit('endRoundNoMoves', { gameId }); // Envoyer un signal pour terminer la manche
         return 0; // Réinitialiser après l’envoi de l’événement
       }
-      
       return newPasses;
     });
   };
@@ -93,13 +109,10 @@ function Game() {
   };
 
   useEffect(() => {
-
-    
     socket.on('updatePlayers', (data) => {
       setPlayers(
         data.map((player) => ({
           ...player,
-          //handCount: player.hand?.length || 0,
         }))
       );
     });
@@ -108,7 +121,6 @@ function Game() {
       setPlayers(
         players.map((player) => ({
           ...player,
-         // handCount: player.hand?.length || 0,
         }))
       );
       setDominos(table);
@@ -119,10 +131,10 @@ function Game() {
         setPlayerHand(currentPlayer.hand || []);
       }
     });
+
     socket.on('waitingRoom', ({ message }) => {
       setWaitingRoomMessage(message); // Définit le message pour les observateurs
     });
-    
 
     socket.on('updateGame', ({ table, players, lastPlayer }) => {
       setDominos(table);
@@ -130,17 +142,11 @@ function Game() {
       if (currentPlayer) {
         setPlayerHand(currentPlayer.hand || []);
       }
-      setPlayers(
-        players.map((player) => ({
-          ...player,
-        // handCount: playerHand.length || 0,
-        }))
-      );
+      setPlayers(players.map((player) => ({ ...player })));
       setLastPlayer(lastPlayer);
       setPassingPlayer(null);
-
-
     });
+
     socket.on('observeGame', ({ players, table, lastPlayer }) => {
       setPlayers(players);
       setDominos(table);
@@ -159,11 +165,34 @@ function Game() {
       setGameResult({ winner, scores });
     });
 
+    // --- EVENTS reconnection même siège / pause ---
+    socket.on('gamePaused', ({ reason }) => {
+      setOverlay({ visible: true, reason: reason || "Partie en pause." });
+    });
+
+    socket.on('waitingForPlayers', ({ needed }) => {
+      setWaitingNeeded(needed);
+    });
+
     socket.on('newRoundStarted', ({ table, players }) => {
+      setOverlay({ visible: false, reason: '' });
+      setWaitingNeeded(null);
       setDominos(table);
       setPlayers(players);
       setPassingPlayer(null);
       setRoundResult(null);
+    });
+
+    socket.on('playerDisconnected', ({ username }) => {
+      setOverlay({ visible: true, reason: `${username} s'est déconnecté. Attente de reconnexion…` });
+    });
+
+    socket.on('playerReconnected', ({ username }) => {
+      setOverlay({ visible: true, reason: `${username} est revenu. Vérification…` });
+    });
+
+    socket.on('seatFreed', ({ username }) => {
+      setOverlay({ visible: true, reason: `Le siège de ${username} a été libéré. En attente du 3ᵉ joueur…` });
     });
 
     socket.on('connect_error', () => {
@@ -173,15 +202,14 @@ function Game() {
     socket.on('error', (errMsg) => {
       setError(errMsg);
     });
+
     // Écoute pour les messages du chat
     socket.on('receiveMessage', ({ username, message }) => {
-    setMessages((prevMessages) => [...prevMessages, { username, message }]);
-    if (!isChatboxVisible) {
-      setNewMessageReceived(true); // ✅ Active l'alerte si la chatbox est fermée
-    }
+      setMessages((prevMessages) => [...prevMessages, { username, message }]);
+      if (!isChatboxVisible) {
+        setNewMessageReceived(true); // ✅ Active l'alerte si la chatbox est fermée
+      }
     });
-
-
 
     return () => {
       socket.off('updatePlayers');
@@ -193,12 +221,19 @@ function Game() {
       socket.off('newRoundStarted');
       socket.off('passTurn');
       socket.off('observeGame');
+
+      // cleanup overlay-related
+      socket.off('gamePaused');
+      socket.off('waitingForPlayers');
+      socket.off('playerDisconnected');
+      socket.off('playerReconnected');
+      socket.off('seatFreed');
+
       socket.off('connect_error');
       socket.off('error');
       socket.off('receiveMessage'); // Nettoyage des messages
     };
-  
-  }, [gameId, username, isChatboxVisible]);
+  }, [gameId, username, isChatboxVisible, userId]);
 
   useEffect(() => {
     const lockOrientation = () => {
@@ -218,54 +253,77 @@ function Game() {
   const otherPlayers = players.filter((player) => player.username !== username);
 
   return (
-    <div style={{     width: '100vw', // Prend toute la largeur de l'écran
+    <div style={{
+      width: '100vw',
       height: '100vh',
-      textAlign: 'center', marginTop: '50px',         backgroundImage: `url(${imageFondJeuUrl})`, // Image de fond
-    backgroundSize: 'cover', // Couvrir tout l'écran
-    backgroundPosition: 'center', // Centrer l'image
-    backgroundRepeat: 'no-repeat', // Éviter la répétition
-    minHeight: '100vh', // S'assurer que le conteneur couvre toute la hauteur
-   //width: '100vw', // Assure que le conteneur couvre toute la largeur visible
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center', }}>
-      {error && <div style={{ color: 'red' }}>{error}</div>}
- 
-      {waitingRoomMessage && (
-        <div style={{ color: 'blue', marginBottom: '20px' }}>
-          <strong>{waitingRoomMessage}</strong>
-
-{/* Bouton de partage */}
-<p> <button onClick={copyGameLink} style={{
-      padding: '10px',
-      fontSize: '16px', // Empêche le zoom automatique
-      marginBottom: '10px',
-      cursor: 'pointer',
-      border: 'none',
-      background: 'none'
+      textAlign: 'center',
+      marginTop: '50px',
+      backgroundImage: `url(${imageFondJeuUrl})`,
+      backgroundSize: 'cover',
+      backgroundPosition: 'center',
+      backgroundRepeat: 'no-repeat',
+      minHeight: '100vh',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
     }}>
-      <img src={shareIcon} alt="Partager" style={{ width: '32px', height: '32px' }} /> INVITE DES JOUEURS
-    </button></p>
+      {error && <div style={{ color: 'red' }}>{error}</div>}
 
-
+      {/* OVERLAY pause / attente */}
+      {overlay.visible && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 1000, color: '#fff', textAlign: 'center', padding: 20
+        }}>
+          <div style={{ background: 'rgba(0,0,0,0.8)', borderRadius: 12, padding: 24, maxWidth: 360 }}>
+            <h2 style={{ marginTop: 0 }}>⏸ Partie en pause</h2>
+            <p style={{ marginBottom: 8 }}>{overlay.reason || "La manche est en pause."}</p>
+            {typeof waitingNeeded === 'number' && waitingNeeded > 0 && (
+              <p>En attente de <strong>{waitingNeeded}</strong> joueur(s)…</p>
+            )}
+            <p style={{ fontSize: 12, opacity: 0.8, marginTop: 12 }}>
+              Partage le lien pour inviter un ami.
+            </p>
+            <button onClick={copyGameLink} style={{ marginTop: 8 }}>📨 Copier le lien</button>
+          </div>
         </div>
       )}
 
-{(roundResult || gameResult) && (
-  <ResultPopup
-    roundResult={roundResult}
-    gameResult={gameResult}
-    username={username}
-    startNewRound={startNewRound}
-  />
-)}
+      {waitingRoomMessage && !joined && (
+        <div style={{ color: 'blue', marginBottom: '20px' }}>
+          <strong>{waitingRoomMessage}</strong>
+
+          {/* Bouton de partage */}
+          <p>
+            <button onClick={copyGameLink} style={{
+              padding: '10px',
+              fontSize: '16px',
+              marginBottom: '10px',
+              cursor: 'pointer',
+              border: 'none',
+              background: 'none'
+            }}>
+              <img src={shareIcon} alt="Partager" style={{ width: '32px', height: '32px' }} /> INVITE DES JOUEURS
+            </button>
+          </p>
+        </div>
+      )}
+
+      {(roundResult || gameResult) && (
+        <ResultPopup
+          roundResult={roundResult}
+          gameResult={gameResult}
+          username={username}
+          startNewRound={startNewRound}
+        />
+      )}
 
       {!joined ? (
         <div>
           <h1>Rejoindre la partie : {gameId}</h1>
           <input 
-          
             type="text"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
@@ -276,66 +334,57 @@ function Game() {
             }}
             placeholder="pseudo et clique sur Entrée"
           />
-
         </div>
       ) : (
         <div>
-         {/* <h1 style={{ fontSize: '0.6em' }}>
-            Partie : {gameId}
-          </h1>*/}
+          {/* <h1 style={{ fontSize: '0.6em' }}>Partie : {gameId}</h1> */}
           <p><strong>Votre pseudo :</strong> {username}</p>
           <p><strong>Dernier domino posé par :</strong> {lastPlayer || 'Aucun'}</p>
 
           {passingPlayer && <p style={{ color: 'red' }}>{passingPlayer} a passé son tour.</p>}
 
-          
-
-          {/* affichage nombre dominos autres joeurs*/} 
-
+          {/* affichage nombre dominos autres joueurs*/} 
           <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%', marginBottom: '10px' }}>
-        {otherPlayers.map((player, index) => (
-          <div key={player.username} style={{ textAlign: 'center', flex: 1 }}>
-            <p style={{ fontWeight: 'bold', color: '#FFF' }}>{player.username}</p>
-            <div style={{ display: 'flex', justifyContent: 'center', gap: '2px' }}>
-            {Array.from({ length: player.handCount || 0 }).map((_, i) => (
-                <img key={i} src={dominoBack} alt="Dos du domino" style={{ width: '10px', height: '20px' }} />
-              ))}
-            </div>
+            {otherPlayers.map((player, index) => (
+              <div key={player.username} style={{ textAlign: 'center', flex: 1 }}>
+                <p style={{ fontWeight: 'bold', color: '#FFF' }}>{player.username}</p>
+                <div style={{ display: 'flex', justifyContent: 'center', gap: '2px' }}>
+                  {Array.from({ length: player.handCount || 0 }).map((_, i) => (
+                    <img key={i} src={dominoBack} alt="Dos du domino" style={{ width: '10px', height: '20px' }} />
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
-
 
           <Board
             players={players}
             dominos={dominos}
             playDomino={playDomino}
           />
-              
-      {/* 📩 Icône de message avec animation */}
-      <img
-        src={newMessageReceived ? iconeMessageNotif : iconeMessage}
-        alt="Message"
-        onClick={toggleChatbox}
-        className={`message-icon ${newMessageReceived ? "shake" : ""}`} // ✅ Ajoute une classe dynamique
-      />
+
+          {/* 📩 Icône de message avec animation */}
+          <img
+            src={newMessageReceived ? iconeMessageNotif : iconeMessage}
+            alt="Message"
+            onClick={toggleChatbox}
+            className={`message-icon ${newMessageReceived ? "shake" : ""}`} // ✅ Ajoute une classe dynamique
+          />
 
           {/* Chatbox */}
           {isChatboxVisible && (
             <div className="chat-popup-overlay" onClick={toggleChatbox}>
-            <div className="chat-popup" onClick={(e) => e.stopPropagation()}>
-              <Chat gameId={gameId} username={username}  initialMessages={messages} />
+              <div className="chat-popup" onClick={(e) => e.stopPropagation()}>
+                <Chat gameId={gameId} username={username} initialMessages={messages} />
+              </div>
             </div>
-          </div>
           )}
 
-
-     {/*<Chat gameId={gameId} username={username} />*/}
-      {/*<VoiceChat gameId={gameId} username={username} />  Intégration ici */}
-      <div style={{ marginTop: '20px', display: 'flex',    justifyContent: 'center',  gap: '50px' }}>
-      <button onClick={passTurn}>TOCKER</button> {/*passer son tour */}
-      <button onClick={leaveGame}>Quitter</button>
-      </div>
+          {/* Boutons */}
+          <div style={{ marginTop: '20px', display: 'flex', justifyContent: 'center', gap: '50px' }}>
+            <button onClick={passTurn}>TOCKER</button> {/* passer son tour */}
+            <button onClick={leaveGame}>Quitter</button>
+          </div>
         </div>
       )}
     </div>
@@ -343,4 +392,3 @@ function Game() {
 }
 
 export default Game;
-
