@@ -18,6 +18,6 @@ export default defineConfig({
     }
   }, 
    preview: {
-    allowedHosts: ['hidden-meadow-68185-d2168c8f325d.herokuapp.com']
+    allowedHosts: ['https://domino-martinique.onrender.com']
   }
 });
