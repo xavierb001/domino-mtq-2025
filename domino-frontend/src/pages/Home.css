@@ -1,0 +1,31 @@
+.home-container {
+    background-image: url('https://res.cloudinary.com/dwvfz8o89/image/upload/f_auto,q_auto/v1/domino/anaswwyymo28wxv6o8fs'); /* Remplacez par le chemin de votre image */
+    background-size: cover;
+    background-position: center;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    color: white;
+    text-align: center;
+  }
+  
+  .content {
+    background-color: rgba(0, 0, 0, 0.5); /* Couche sombre pour le texte */
+    padding: 20px;
+    border-radius: 10px;
+  }
+  
+  .start-button {
+    padding: 10px 20px;
+    font-size: 18px;
+    color: white;
+    background-color: #007bff;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  
+  .start-button:hover {
+    background-color: #0056b3;
+  }

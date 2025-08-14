@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: domino-martinique
+    env: static
+    buildCommand: cd domino-frontend && npm install && npm run build
+    staticPublishPath: ./domino-frontend/dist
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+  - type: web
+    name: domino-martinique-api
+    env: node
+    buildCommand: cd domino-backend && npm install
+    startCommand: cd domino-backend && node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
