@@ -43,6 +43,7 @@ function Home() {
       <div className="content">
     <div style={{ textAlign: 'center', marginTop: '50px' }}>
       <h1>Bienvenue sur Domino F.W.I </h1>
+         <h2>3 joueurs nécessaires </h2>
       <div style={{ margin: '20px' }}>
         <button onClick={createGame} style={{ padding: '10px 20px', marginBottom: '20px' }}>
           Créer une Nouvelle Partie
