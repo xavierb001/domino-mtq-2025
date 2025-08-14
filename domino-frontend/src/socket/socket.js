@@ -12,13 +12,3 @@ const socket = io(BACKEND_URL, {
 
 export default socket;
 
-services:
-  - type: web
-    name: domino-frontend
-    buildCommand: cd domino-frontend && npm install && npm run build
-    staticPublishPath: ./domino-frontend/dist
-    
-  - type: web
-    name: domino-backend
-    buildCommand: cd domino-backend && npm install
-    startCommand: cd domino-backend && npm

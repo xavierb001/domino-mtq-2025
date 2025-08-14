@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node server.js",
     "optimize-images": "node scripts/optimizeImages.js",
-    "heroku-postbuild": "cd ../../domino-frontend && npm install && npm run build && cd ../domino-backend && npm install",
     "dev": "nodemon server.js"
   },
   "engines": {
