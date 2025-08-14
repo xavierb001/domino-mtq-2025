@@ -1,17 +1,15 @@
+// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
+
 const PORT = process.env.PORT || 3000;
 const app = express();
 
-
-
-
-//const staticFolder = path.join(__dirname, 'dist');
-
-// Force HTTPS in production
+////////////////////////////////////////////////////////////////////////////////
+// HTTPS (prod)
 if (process.env.NODE_ENV === 'production') {
   app.use((req, res, next) => {
     if (req.header('x-forwarded-proto') !== 'https') {
@@ -23,21 +21,24 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 const FRONTEND_URL = process.env.NODE_ENV === "production"
-  ? "https://domino-martinique.onrender.com" 
+  ? "https://domino-martinique.onrender.com"
   : "http://localhost:5173";
 
-
-
-// Servir les fichiers statiques
+////////////////////////////////////////////////////////////////////////////////
+// Static front
 app.use(express.static(path.join(__dirname, '../domino-frontend/dist')));
 
-// CORS configuration
+////////////////////////////////////////////////////////////////////////////////
+// CORS
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://domino-martinique.onrender.com'], 
+  origin: ['http://localhost:5173', 'https://domino-martinique.onrender.com'],
   methods: ['GET', 'POST'],
   credentials: true,
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
+////////////////////////////////////////////////////////////////////////////////
+// HTTP + Socket.IO
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
@@ -57,13 +58,13 @@ const io = new Server(server, {
   }
 });
 
+////////////////////////////////////////////////////////////////////////////////
+// Game state
+const REQUIRED_PLAYERS = 3;
+const RECONNECT_GRACE_MS = 2 * 60 * 1000; // 2 minutes
 
+let games = {}; // { [gameId]: GameState }
 
-
-
-let games = {}; // Stockage des parties
-
-// **Initialiser un set complet de dominos**
 function initializeDominoSet() {
   const dominoSet = [];
   for (let i = 0; i <= 6; i++) {
@@ -74,374 +75,359 @@ function initializeDominoSet() {
   return dominoSet;
 }
 
-// **Initialiser une partie**
 function initializeGame(gameId) {
   games[gameId] = {
-    players: [],
-    waitingRoom: [], // Liste des joueurs en attente
+    players: [],         // [{ userId, id: socketId|null, username, connected, hand, handC, score }]
+    observers: [],       // [{ id: socketId, username }]
     table: [],
-    consecutivePasses: 0, // Nouveau compteur
-    scores: {},
+    consecutivePasses: 0,
     dominoSet: initializeDominoSet(),
     inProgress: false,
-    lastPlayer: null, // Dernier joueur à avoir posé un domino
-    observers: [], // Liste des observateurs
+    lastPlayer: null,
+    reconnectTimers: {}, // userId -> setTimeout handle
   };
   console.log(`[Game] Nouvelle partie initialisée : ${gameId}`);
 }
 
-// **Distribuer des dominos à chaque joueur**
 function distributeDominos(gameId) {
   const game = games[gameId];
-  const dominoSet = [...game.dominoSet];
+  const dominoSet = [...initializeDominoSet()]; // reset complet à chaque manche
   game.players.forEach((player) => {
     player.hand = [];
-     player.handC=  0;
     for (let i = 0; i < 7; i++) {
       const randomIndex = Math.floor(Math.random() * dominoSet.length);
       player.hand.push(dominoSet.splice(randomIndex, 1)[0]);
     }
-    player.handC=7;
+    player.handC = player.hand.length;
   });
 }
 
-// **Rejoindre une partie**
+function connectedCount(game) {
+  return game.players.filter(p => p.connected).length;
+}
+
+function broadcastPlayers(gameId) {
+  const game = games[gameId];
+  if (!game) return;
+  io.to(gameId).emit('updatePlayers', game.players.map(p => ({
+    userId: p.userId,
+    username: p.username,
+    score: p.score,
+    connected: p.connected
+  })));
+}
+
+function pauseGame(gameId, reason = 'Partie en pause.') {
+  const game = games[gameId];
+  if (!game) return;
+  if (game.inProgress) {
+    game.inProgress = false;
+    io.to(gameId).emit('gamePaused', { reason });
+  }
+  io.to(gameId).emit('waitingForPlayers', {
+    needed: Math.max(0, REQUIRED_PLAYERS - connectedCount(game)),
+    players: game.players.map(p => ({ username: p.username, connected: p.connected })),
+  });
+  broadcastPlayers(gameId);
+}
+
+function startNewRound(gameId) {
+  const game = games[gameId];
+  if (!game) return;
+  // On démarre uniquement si 3 connectés
+  if (connectedCount(game) < REQUIRED_PLAYERS) {
+    pauseGame(gameId, 'En attente du 3ᵉ joueur pour démarrer la manche.');
+    return;
+  }
+  game.table = [];
+  game.consecutivePasses = 0;
+  game.inProgress = true;
+
+  distributeDominos(gameId);
+
+  // Envoie chaque main de façon privée
+  game.players.forEach((p) => {
+    if (p.connected && p.id) {
+      io.to(p.id).emit('updateHand', p.hand);
+    }
+  });
+
+  io.to(gameId).emit('newRoundStarted', {
+    table: game.table,
+    players: game.players.map(p => ({
+      username: p.username,
+      handCount: p.handC,
+      score: p.score,
+      connected: p.connected
+    })),
+  });
+  broadcastPlayers(gameId);
+}
+
+function tryStartOrResume(gameId) {
+  const game = games[gameId];
+  if (!game) return;
+  if (connectedCount(game) >= REQUIRED_PLAYERS) {
+    // Si la partie n’est pas en cours, on (re)démarre une manche
+    if (!game.inProgress) {
+      startNewRound(gameId);
+    }
+  } else {
+    pauseGame(gameId, 'En attente de joueurs pour continuer.');
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Socket.IO single connection block
 io.on('connection', (socket) => {
   console.log(`[Socket.IO] Nouvelle connexion : ${socket.id}`);
 
-  socket.on('joinGame', ({ gameId, username }) => {
-    if (!gameId || !username) {
-      console.error('[Error] ID de partie ou pseudo manquant.');
+  // --- JOIN GAME (avec userId persistant) ---
+  socket.on('joinGame', ({ gameId, username, userId }) => {
+    if (!gameId || !username || !userId) {
+      console.error('[Error] gameId / username / userId manquant.');
+      return;
+    }
+    if (!games[gameId]) initializeGame(gameId);
+    const game = games[gameId];
+
+    socket.join(gameId);
+
+    // Reconnexion (même siège) ?
+    let player = game.players.find(p => p.userId === userId);
+    if (player) {
+      // Annule le timer d’abandon si présent
+      const t = game.reconnectTimers[userId];
+      if (t) {
+        clearTimeout(t);
+        delete game.reconnectTimers[userId];
+      }
+      // Rattache le nouveau socket
+      player.id = socket.id;
+      player.connected = true;
+      player.username = username || player.username;
+
+      // Renvoyer sa main et l’état
+      io.to(player.id).emit('updateHand', player.hand || []);
+      io.to(gameId).emit('playerReconnected', { username: player.username });
+
+      console.log(`[Game] ${player.username} s’est reconnecté sur ${gameId}.`);
+      tryStartOrResume(gameId);
+      broadcastPlayers(gameId);
       return;
     }
 
-    if (!games[gameId]) {
-      initializeGame(gameId);
-    }
+    // Nouvelle place si siège libre
+    if (game.players.length < REQUIRED_PLAYERS) {
+      player = {
+        userId,
+        id: socket.id,
+        username,
+        connected: true,
+        hand: [],
+        handC: 0,
+        score: 0,
+      };
+      game.players.push(player);
+      console.log(`[Game] ${username} a rejoint ${gameId} (${game.players.length}/${REQUIRED_PLAYERS}).`);
 
-    const game = games[gameId];
- // Rejoindre en tant que joueur
-    if (game.players.length < 3) {
-      game.players.push({ id: socket.id, username, hand: [], score: 0 });
-      socket.join(gameId);
-
-      console.log(`[Game] ${username} a rejoint la partie ${gameId}.`);
-      if (game.players.length === 3 && !game.inProgress) {
-        game.inProgress = true;
-        distributeDominos(gameId);
-
-        game.players.forEach((player) => {
-          io.to(player.id).emit('updateHand', player.hand);
-        });
-
-        io.to(gameId).emit('startGame', {
-          players: game.players.map((p) => ({ username: p.username })),
-          table: game.table,
-        });
+      if (game.players.length === REQUIRED_PLAYERS && connectedCount(game) === REQUIRED_PLAYERS) {
+        // Première fois qu’on atteint 3 : on lance la manche
+        startNewRound(gameId);
+      } else {
+        pauseGame(gameId, 'En attente de joueurs pour commencer.');
       }
-    } else {
-      // Rejoindre en tant qu'observateur
-      game.observers.push({ id: socket.id, username });
-      socket.join(gameId);
-      socket.emit('waitingRoom', { message: 'Vous êtes dans la salle d’attente.', gameId });
-      socket.emit('observeGame', {
-        players: game.players.map((p) => ({
-          username: p.username,
-          handCount: p.handC,
-          score: p.score,
-        })),
-        table: game.table,
-        lastPlayer: game.lastPlayer,
-      });
-      console.log(`[Game] ${username} observe la partie ${gameId}.`);
+      broadcastPlayers(gameId);
+      return;
     }
 
-    io.to(gameId).emit('updatePlayers', game.players);
+    // Sinon, observateur
+    game.observers.push({ id: socket.id, username });
+    socket.emit('waitingRoom', { message: 'Vous êtes dans la salle d’attente.', gameId });
+    socket.emit('observeGame', {
+      players: game.players.map((p) => ({
+        username: p.username,
+        handCount: p.handC,
+        score: p.score,
+        connected: p.connected
+      })),
+      table: game.table,
+      lastPlayer: game.lastPlayer,
+    });
+    console.log(`[Game] ${username} observe ${gameId}.`);
+    broadcastPlayers(gameId);
   });
- 
-  // **Jouer un domino**
+
+  // --- PLAY DOMINO ---
   socket.on('playDomino', ({ gameId, domino, side }) => {
     const game = games[gameId];
-    if (!game || !domino) {
-      console.error('[Error] ID de partie ou domino manquant.');
-      socket.emit('error', { message: 'Données invalides pour jouer le domino.' });
+    if (!game || !Array.isArray(domino)) return;
+    if (!game.inProgress) {
+      socket.emit('error', { message: 'La partie est en pause.' });
       return;
     }
 
-    const player = game.players.find((p) => p.id === socket.id);
+    const player = game.players.find((p) => p.id === socket.id && p.connected);
     if (!player) {
-      console.error('[Error] Joueur non trouvé.');
-      socket.emit('error', { message: 'Joueur introuvable dans la partie.' });
+      socket.emit('error', { message: 'Joueur introuvable ou déconnecté.' });
       return;
     }
 
-    // Si le tableau est vide, ajouter directement le domino
     if (game.table.length === 0) {
       game.table.push(domino);
       game.consecutivePasses = 0;
       player.handC--;
     } else {
-      console.log(`test partie fini.`);
-      // Vérifier et jouer sur le côté choisi
-      if (side === 'left' && (game.table[0][0] === domino[1] || game.table[0][0] === domino[0])) {
-        if (game.table[0][0] === domino[1]) {
-          game.table.unshift(domino);
-          game.consecutivePasses = 0;
-          player.handC--;
-        } else {
-          game.table.unshift([domino[1], domino[0]]);
-          game.consecutivePasses = 0;
-          player.handC--;
-        }
-      } else if (side === 'right' && (game.table[game.table.length - 1][1] === domino[0] || game.table[game.table.length - 1][1] === domino[1])) {
-        if (game.table[game.table.length - 1][1] === domino[0]) {
-          game.table.push(domino);
-          game.consecutivePasses = 0;
-          player.handC--;
-        } else {
-          game.table.push([domino[1], domino[0]]);
-          game.consecutivePasses = 0;
-          player.handC--;
-        }
+      const leftVal = game.table[0][0];
+      const rightVal = game.table[game.table.length - 1][1];
+
+      if (side === 'left' && (leftVal === domino[1] || leftVal === domino[0])) {
+        game.table.unshift(leftVal === domino[1] ? domino : [domino[1], domino[0]]);
+        player.handC--;
+        game.consecutivePasses = 0;
+      } else if (side === 'right' && (rightVal === domino[0] || rightVal === domino[1])) {
+        game.table.push(rightVal === domino[0] ? domino : [domino[1], domino[0]]);
+        player.handC--;
+        game.consecutivePasses = 0;
       } else {
-        console.error('[Error] Domino non jouable à cet emplacement.');
         socket.emit('error', { message: 'Ce domino ne peut pas être posé ici.' });
         return;
       }
     }
 
-    // Mettre à jour la main du joueur
-    player.hand = player.hand.filter((d) => !(d[0] === domino[0] && d[1] === domino[1]));
-    
-    //console.log(player.hand.length);  
-    console.log( "go " + player.handC); 
-    // Mettre à jour les joueurs
+    // Retire le domino de la main
+    player.hand = player.hand.filter(d => !(d[0] === domino[0] && d[1] === domino[1]));
     game.lastPlayer = player.username;
-    console.log(player.handC+ "verif fin");
-    // Vérifier si la manche est terminée
-    if (player.handC === 0) {
-      console.log(`test manche fini.`);
-      player.score++;
 
-      // Logique de fin de manche ou de partie
-      if (player.score >= 3 || game.players.every((p) => p.score >= 1)) {
-        io.to(gameId).emit('gameOver', {
-          winner: player.score >= 3 ? player.username : null,
-          scores: game.players.map((p) => ({ username: p.username, score: p.score })),
-        });
+    // Fin de manche si main vide
+    if (player.handC === 0) {
+      player.score++;
+      const scoresPayload = game.players.map(p => ({ username: p.username, score: p.score }));
+
+      if (player.score >= 3) {
+        io.to(gameId).emit('gameOver', { winner: player.username, scores: scoresPayload });
         delete games[gameId];
         return;
       }
 
-      // Réinitialiser pour la prochaine manche
-      game.table = [];
-      distributeDominos(gameId);
-      game.players.forEach((p) => io.to(p.id).emit('updateHand', p.hand));
-      io.to(gameId).emit('roundEnd', {
-        winner: player.username,
-        scores: game.players.map((p) => ({ username: p.username, score: p.score })),
-      });
+      io.to(gameId).emit('roundEnd', { winner: player.username, scores: scoresPayload });
+      startNewRound(gameId);
       return;
     }
 
-    // Mettre à jour les joueurs et le plateau
+    // Mise à jour plateau
     io.to(gameId).emit('updateGame', {
       table: game.table,
       players: game.players.map((p) => ({
         username: p.username,
         handCount: p.handC,
+        connected: p.connected
       })),
       lastPlayer: game.lastPlayer,
     });
   });
 
-// **Passer son tour**
-socket.on('passTurn', ({ gameId }) => {
-  const game = games[gameId];
-  if (!game) {
-    console.error('[Error] Partie introuvable.');
-    return;
-  }
-
-  const player = game.players.find((p) => p.id === socket.id);
-  if (!player) {
-    console.error('[Error] Joueur non trouvé.');
-    return;
-  }
-
-  // Initialiser le compteur de passes s'il n'existe pas
-  if (!game.consecutivePasses) {
-    game.consecutivePasses = 0;
-  }
-
-  // Incrémenter le compteur de passes
-  game.consecutivePasses++;
-
-  // Notifier les autres joueurs que le joueur a passé son tour
-  io.to(gameId).emit('passTurn', { player: player.username });
-
-  console.log(`[Game] Joueur ${player.username} a passé son tour. (${game.consecutivePasses}/${game.players.length})`);
-  console.log(game.consecutivePasses);
-  // Vérifier si tous les joueurs ont passé leur tour consécutivement
-  if (game.consecutivePasses >= game.players.length) {
-    console.log(`[Game] Tous les joueurs ont passé leur tour. La manche est terminée.`);
-   // io.to(gameId).emit('endRoundNoMoves', { message: "Tous les joueurs ont passé leur tour. Fin de la manche !" });
-
-    // Réinitialiser le compteur pour la prochaine manche
-   // game.consecutivePasses = 0;
-   io.to(gameId).emit('roundEnd', { winner: "Aucun", message: "Tous les joueurs ont passé leur tour. La manche est terminée." });
-   console.log(`test passing`);
-   // Réinitialiser le jeu
-   games[gameId].table = [];
-   games[gameId].consecutivePasses = 0;
-
-  }
-});
-socket.on('endRoundNoMoves', ({ gameId }) => {
-  if (!games[gameId]) return;
-
-  io.to(gameId).emit('roundEnd', { winner: "Aucun", message: "Tous les joueurs ont passé leur tour. La manche est terminée." });
-  console.log(`test passing2`);
-  // Réinitialiser le jeu
-  games[gameId].table = [];
-  games[gameId].consecutivePasses = 0;
-});
-
-
-  // **Démarrer une nouvelle manche**
-  socket.on('startNewRound', ({ gameId }) => {
+  // --- PASS TURN ---
+  socket.on('passTurn', ({ gameId }) => {
     const game = games[gameId];
-    if (!game) {
-      console.error('[Error] Partie introuvable.');
-      return;
+    if (!game || !game.inProgress) return;
+
+    const player = game.players.find((p) => p.id === socket.id && p.connected);
+    if (!player) return;
+
+    game.consecutivePasses = (game.consecutivePasses || 0) + 1;
+    io.to(gameId).emit('passTurn', { player: player.username });
+
+    if (game.consecutivePasses >= connectedCount(game)) {
+      io.to(gameId).emit('roundEnd', { winner: 'Aucun', message: 'Tous les joueurs ont passé.' });
+      startNewRound(gameId);
     }
-
-    // Réinitialiser la table et distribuer les dominos
-    game.table = [];
-    distributeDominos(gameId);
-   // distributeDominos(gameId);
-    game.players.forEach((p) => io.to(p.id).emit('updateHand', p.hand));
-
-    io.to(gameId).emit('newRoundStarted', {
-      table: game.table,
-      players: game.players.map((p) => ({
-        username: p.username,
-        handCount: p.handC,
-      })),
-    });
-
-    console.log(`[Game] Nouvelle manche commencée pour la partie ${gameId}`);
   });
 
-  // **Déconnexion**
-  // **Gérer le départ d'un joueur**
- 
-  socket.on('disconnect', () => {
-    console.log(`[Socket.IO] Déconnexion : ${socket.id}`);
-    for (const gameId in games) {
-      const game = games[gameId];
-      if (!game) continue; // Si la partie n'existe pas, on ignore
+  // --- START NEW ROUND (bouton manuel côté client si besoin) ---
+  socket.on('startNewRound', ({ gameId }) => startNewRound(gameId));
 
-      // Retirer le joueur ou observateur déconnecté
-      const playerIndex = game.players.findIndex((p) => p.id === socket.id);
-      if (playerIndex !== -1) {
-        game.players.splice(playerIndex, 1);
-        console.log(`joueur déco`);
-
-        // Vérifier s'il y a des observateurs pour remplacer le joueur
-        if (game.observers.length > 0) {
-          console.log(`test ajout de jouer `);
-          const newPlayer = game.observers.shift();
-          game.players.push({ id: newPlayer.id, username: newPlayer.username, hand: [], score: 0 });
-          distributeDominos(gameId);
-          io.to(newPlayer.id).emit('updateHand', []);
-          console.log(`[Game] ${newPlayer.username} a remplacé un joueur dans la partie ${gameId}.`);
-
-
-        // Mettez à jour les mains des joueurs
-        game.players.forEach((player) => {
-          io.to(player.id).emit('updateHand', player.hand);
-        });
-        // Réinitialisez la partie
-        game.table = [];
-        game.scores = {};
-        distributeDominos(gameId);
-
-
-
-
-          io.to(gameId).emit('startGame', {
-            players: game.players.map((p) => ({ username: p.username })),
-            table: game.table,
-          });
-        }
-      } else {
-        // Retirer l'observateur déconnecté
-        game.observers = game.observers.filter((obs) => obs.id !== socket.id);
-      }
-
-      if (game.players.length === 0 && game.observers.length === 0) {
-        delete games[gameId];
-      } else {
-        io.to(gameId).emit('updatePlayers', game.players);
-      }
-    }})
-  });
-
-
-// **Gérer les messages de chat**
-io.on('connection', (socket) => {
-  console.log(`[Socket.IO] Nouvelle connexion : ${socket.id}`);
-
+  // --- CHAT ---
   socket.on('sendMessage', ({ gameId, username, message }) => {
     if (games[gameId]) {
-      io.to(gameId).emit('receiveMessage', { username, message }); // Diffuser le message à tous les joueurs
-      console.log(`[Chat] Message de ${username} dans la partie ${gameId} : ${message}`);
-    } else {console.error(`[Error] Partie non trouvée pour l'ID : ${gameId}`);
-    return;}
+      io.to(gameId).emit('receiveMessage', { username, message });
+    }
   });
 
-  socket.on('disconnect', () => {
-    console.log(`[Socket.IO] Déconnexion : ${socket.id}`);
-  });
-});
-
-// Gérer le signaling pour WebRTC
-io.on('connection', (socket) => {
+  // --- WEBRTC SIGNALING ---
   socket.on('signal', ({ gameId, signal, to }) => {
     io.to(to).emit('signal', { signal, from: socket.id });
   });
 
   socket.on('joinVoiceChannel', ({ gameId }) => {
     socket.join(gameId);
-    const players = [...io.sockets.adapter.rooms.get(gameId)]; // Liste des joueurs dans la salle
-    socket.emit('playersInRoom', players.filter((id) => id !== socket.id));
+    const players = [...io.sockets.adapter.rooms.get(gameId)];
+    socket.emit('playersInRoom', players.filter(id => id !== socket.id));
   });
+
+  // --- DISCONNECT ---
   socket.on('disconnect', () => {
     console.log(`[Socket.IO] Déconnexion : ${socket.id}`);
+
+    for (const gameId in games) {
+      const game = games[gameId];
+      if (!game) continue;
+
+      // Marque le joueur comme déconnecté (sans supprimer le siège)
+      const player = game.players.find(p => p.id === socket.id && p.connected);
+      if (player) {
+        player.connected = false;
+        player.id = null;
+        io.to(gameId).emit('playerDisconnected', { username: player.username });
+        pauseGame(gameId, `${player.username} a quitté la partie. Siège réservé ${RECONNECT_GRACE_MS / 1000}s.`);
+
+        // Lance un timer de grâce pour libérer le siège si pas de reconnexion
+        if (game.reconnectTimers[player.userId]) {
+          clearTimeout(game.reconnectTimers[player.userId]);
+        }
+        game.reconnectTimers[player.userId] = setTimeout(() => {
+          // Si toujours déconnecté, on libère le siège
+          const still = game.players.find(p => p.userId === player.userId);
+          if (still && !still.connected) {
+            game.players = game.players.filter(p => p.userId !== player.userId);
+            delete game.reconnectTimers[player.userId];
+            io.to(gameId).emit('seatFreed', { username: player.username });
+
+            // Si plus personne du tout
+            if (game.players.length === 0 && game.observers.length === 0) {
+              delete games[gameId];
+            } else {
+              pauseGame(gameId, 'Siège libéré. En attente du 3ᵉ joueur.');
+            }
+          }
+        }, RECONNECT_GRACE_MS);
+      } else {
+        // Retire un observateur qui se déconnecte
+        const before = game.observers.length;
+        game.observers = game.observers.filter(o => o.id !== socket.id);
+        if (before !== game.observers.length) {
+          // rien de spécial à faire
+        }
+      }
+    }
   });
 });
 
-
-// Servir l'application frontend
+////////////////////////////////////////////////////////////////////////////////
+// Front fallback
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../domino-frontend/dist/index.html'));
 });
 
-// Démarrer le serveur
+////////////////////////////////////////////////////////////////////////////////
+// Start
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Serveur lancé sur le port ${PORT}`);
   console.log(`🌍 Frontend accessible sur : ${FRONTEND_URL}`);
 });
 
-// Optionnel : Une route 404 pour toutes les autres requêtes
+////////////////////////////////////////////////////////////////////////////////
+// 404 (optionnel)
 app.use((req, res) => {
   res.status(404).send('Route non définie.');
-});
-
-app.use((req, res, next) => {
-  if (req.headers['x-forwarded-proto'] !== 'https') {
-    return res.redirect('https://' + req.headers.host + req.url);
-  }
-  next();
 });
