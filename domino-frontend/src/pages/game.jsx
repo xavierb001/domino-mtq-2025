@@ -274,7 +274,7 @@ function Game() {
                 joinGame();
               }
             }}
-            placeholder="Entrez votre pseudo"
+            placeholder="pseudo et clique sur Entrée"
           />
 
         </div>
