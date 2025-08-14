@@ -54,7 +54,8 @@ The application is deployed on Render:
 ## License
 
 MIT License
+TOUT DROIT RÉSERVÉ
 
 ## Authors
 
-- Your Name
+Xavier BEAUNOL 
