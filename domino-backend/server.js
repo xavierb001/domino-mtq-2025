@@ -23,7 +23,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 const FRONTEND_URL = process.env.NODE_ENV === "production"
-  ? "https://hidden-meadow-68185-d2168c8f325d.herokuapp.com" // Mets ton URL Heroku
+  ? "https://domino-martinique.onrender.com" 
   : "http://localhost:5173";
 
 
@@ -33,7 +33,7 @@ app.use(express.static(path.join(__dirname, '../domino-frontend/dist')));
 
 // CORS configuration
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://hidden-meadow-68185-d2168c8f325d.herokuapp.com'], 
+  origin: ['http://localhost:5173', 'https://domino-martinique.onrender.com'], 
   methods: ['GET', 'POST'],
   credentials: true,
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -41,7 +41,7 @@ app.use(cors({
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ['http://localhost:5173', 'https://hidden-meadow-68185-d2168c8f325d.herokuapp.com'],
+    origin: ['http://localhost:5173', 'https://domino-martinique.onrender.com'],
     methods: ['GET', 'POST'],
     credentials: true,
     transports: ['websocket', 'polling'],
